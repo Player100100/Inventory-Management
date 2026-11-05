@@ -6,16 +6,23 @@
   -> 需求数量 = BOM Quantity × 套数
   -> 与库存逐项比对，扣减用掉的量（自动备份库存表）
   -> 输出「删掉已满足项」的需采购 BOM（Quantity 列 = 实际要买的缺口）
+  -> 可选：运行前 git pull、扣减后 commit + push 库存表，多人共用一份库存
+
+BOM 必填 Quantity；Device / Manufacturer Part / Comment 至少一个；
+Supplier Part、Footprint、Value、Category、Designator 建议保留。
+详见 README.md 或界面上的「BOM 要求」按钮。
 
 命令行（便于脚本化 / 测试）:
     python bom_gui.pyw --cli BOM.xlsx --sets 10
     python bom_gui.pyw --cli BOM.xlsx --sets 10 --stock 库存.xlsx -o 采购.xlsx
     python bom_gui.pyw --cli BOM.xlsx --sets 10 --dry-run     # 只算不扣库存
+    python bom_gui.pyw --cli BOM.xlsx --sets 10 --no-sync     # 不同步 GitHub
 """
 from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +83,130 @@ def _find_header_row(rows, hints, limit: int = 15) -> int:
         if hit >= 2:
             return i
     raise ValueError("前 15 行里找不到表头")
+
+
+# ---------------------------------------------------------------- GitHub 同步
+
+
+class GitSyncError(RuntimeError):
+    pass
+
+
+class GitSync:
+    """只同步库存 xlsx：运行前 pull，扣减后 add / commit / push。
+
+    只操作指定的库存文件，不会把 BOM、采购结果等本地文件提交上去。
+    """
+
+    NET_ERR = ("Could not connect", "Failed to connect", "Connection refused",
+               "Connection timed out", "unable to access",
+               "Could not resolve host")
+
+    def __init__(self, repo: Path):
+        self.repo = Path(repo).resolve()
+        self.git = shutil.which("git")
+        self.available = bool(self.git) and (self.repo / ".git").exists()
+
+    def _cmd(self, args, bypass_proxy: bool):
+        cmd = ["git", "-C", str(self.repo)]
+        if bypass_proxy:
+            cmd[1:1] = ["-c", "http.proxy=", "-c", "https.proxy="]
+        return cmd + args
+
+    def _run(self, args, bypass_proxy: bool = False, timeout: int = 180):
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return subprocess.run(
+            self._cmd(args, bypass_proxy), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout, **kwargs)
+
+    @staticmethod
+    def _msg(r) -> str:
+        return (r.stderr or r.stdout or "").strip() or \
+            f"git 退出码 {r.returncode}"
+
+    def _is_net_err(self, r) -> bool:
+        text = f"{r.stdout}\n{r.stderr}"
+        return any(k in text for k in self.NET_ERR)
+
+    def _run_net(self, args, timeout: int = 180):
+        """先按全局配置走；代理连不上时自动绕过代理重试一次。"""
+        r = self._run(args, timeout=timeout)
+        if r.returncode != 0 and self._is_net_err(r):
+            r2 = self._run(args, bypass_proxy=True, timeout=timeout)
+            if r2.returncode == 0:
+                return r2
+            raise GitSyncError(self._msg(r2))
+        return r
+
+    def pull(self) -> str:
+        r = self._run_net(["pull", "--ff-only"])
+        if r.returncode != 0:
+            raise GitSyncError(self._msg(r))
+        return (r.stdout or "").strip()
+
+    def commit_and_push(self, rel_path: str, message: str) -> str:
+        """提交并推送单个文件；返回 pushed / nochange。"""
+        r = self._run(["add", "--", rel_path])
+        if r.returncode != 0:
+            raise GitSyncError(self._msg(r))
+
+        staged = self._run(["diff", "--cached", "--name-only"])
+        if not (staged.stdout or "").strip():
+            return "nochange"
+
+        r = self._run(["commit", "-m", message])
+        if r.returncode != 0:
+            raise GitSyncError(self._msg(r))
+
+        r = self._run_net(["push"])
+        if r.returncode != 0:
+            # 别人先推了：先 rebase 再重试
+            pr = self._run_net(["pull", "--rebase"])
+            if pr.returncode != 0:
+                self._run(["rebase", "--abort"])
+                raise GitSyncError(
+                    "远程库存已被他人更新，自动合并失败。请先手动执行 "
+                    "git pull 并解决冲突后再试。\n" + self._msg(pr))
+            r = self._run_net(["push"])
+            if r.returncode != 0:
+                raise GitSyncError(self._msg(r))
+        return "pushed"
+
+
+BOM_HELP = """BOM 表要求（读取第一张工作表，表头需在前 15 行内）
+
+【必填】
+  Quantity（数量）
+      每个位号的需求数量；最终需求 = 该值 × 生产套数。
+
+【至少填一项，用于匹配库存】
+  Device（器件）
+  Manufacturer Part（厂商型号）
+  Comment（名称）
+
+【强烈建议】
+  Supplier Part（供应商编号）
+      如 C20917，立创编号匹配最准确。
+  Footprint（封装）
+      0603 电阻/电容免购判断需要。
+
+【可选】
+  Value（值）        如 10kΩ、100nF
+  Category（分类）   区分电阻/电容
+  Designator（位号） 输出与核对用
+  Manufacturer（厂商）
+
+【列名别名】
+  数量、名称、位号、封装、值、分类、厂商型号、供应商编号 均可识别。
+  立创 / 嘉立创 EDA 导出的 BOM 默认就包含以上列，可直接使用。
+
+【库存表】
+  必填：货品、现有库存数量
+  可选：货架、货品类型、单价、立创商城商品编号、参数简介、总计消耗数量
+  「现有库存数量」为 -1 时视为充足/不计数，不参与扣减。
+"""
 
 
 class StockBook:
@@ -278,7 +409,8 @@ def apply_stock(stock: StockBook, used_by_item: dict[int, float],
 
 def run(bom_path, sets: int, stock_path=None, out_path=None,
         rc_path=DEFAULT_RC, threshold: float = 0.82,
-        update_stock: bool = True, backup: bool = True, log=print) -> dict:
+        update_stock: bool = True, backup: bool = True,
+        sync: bool = False, repo_dir=None, log=print) -> dict:
     bom_path = Path(bom_path)
     sets = int(sets)
     if sets <= 0:
@@ -288,6 +420,26 @@ def run(bom_path, sets: int, stock_path=None, out_path=None,
     stock_path = Path(stock_path) if stock_path else DEFAULT_STOCK
     if not stock_path.exists():
         raise FileNotFoundError(f"找不到库存表: {stock_path}")
+
+    repo_dir = Path(repo_dir).resolve() if repo_dir else BASE_DIR.resolve()
+
+    # 先拉取最新库存，保证多人协作时基于最新数据扣减
+    syncer = None
+    if sync and update_stock:
+        syncer = GitSync(repo_dir)
+        if syncer.available:
+            log("[同步] 正在拉取 GitHub 上的最新库存 ...")
+            try:
+                out = syncer.pull()
+                first = next((ln for ln in out.splitlines()
+                              if ln.strip() and "Already up to date" not in ln),
+                             "已是最新")
+                log(f"[同步] {first}")
+            except (GitSyncError, subprocess.TimeoutExpired) as e:
+                log(f"[同步] 拉取失败，继续使用本地库存：{e}")
+        else:
+            log("[同步] 未检测到 Git 仓库或 git 命令，跳过自动同步")
+            syncer = None
 
     data = compute(bom_path, stock_path, sets, rc_path, threshold)
     stats = data["stats"]
@@ -364,12 +516,32 @@ def run(bom_path, sets: int, stock_path=None, out_path=None,
         log("")
         log("库存扣减   : 已跳过（dry-run）")
 
+    # 扣减完成后把库存表提交并推送到 GitHub
+    sync_status = None
+    if syncer and changed:
+        try:
+            rel = stock_path.resolve().relative_to(repo_dir)
+        except ValueError:
+            log("[同步] 库存表不在仓库目录内，跳过同步")
+        else:
+            msg = (f"库存更新 {datetime.now():%Y-%m-%d %H:%M}: "
+                   f"{bom_path.stem} ×{sets} 套，扣减 {len(changed)} 种货品")
+            log("[同步] 正在提交并推送库存表 ...")
+            try:
+                sync_status = syncer.commit_and_push(rel.as_posix(), msg)
+                log("[同步] 已推送到 GitHub"
+                    if sync_status == "pushed"
+                    else "[同步] 库存无变化，未提交")
+            except (GitSyncError, subprocess.TimeoutExpired) as e:
+                log(f"[同步] 推送失败：{e}")
+
     return {
         "out_path": out_path,
         "purchase_count": len(data["purchase_rows"]),
         "stats": stats,
         "changed": changed,
         "backup_path": backup_path,
+        "sync": sync_status,
     }
 
 
@@ -393,6 +565,8 @@ def start_gui(selftest: bool = False):
     rc_var = tk.BooleanVar(value=DEFAULT_RC.exists())
     upd_var = tk.BooleanVar(value=True)
     bak_var = tk.BooleanVar(value=True)
+    git_ok = GitSync(BASE_DIR).available
+    sync_var = tk.BooleanVar(value=git_ok)
 
     # 只有一个 BOM 文件时自动填上
     cands = [p for p in BASE_DIR.glob("*.xlsx")
@@ -449,17 +623,31 @@ def start_gui(selftest: bool = False):
     ttk.Checkbutton(opts, text="保存前备份库存表", variable=bak_var).pack(
         side="left")
 
+    opts2 = ttk.Frame(frm)
+    opts2.grid(row=4, column=0, columnspan=3, sticky="w", pady=(2, 2))
+    sync_cb = ttk.Checkbutton(
+        opts2, text="库存更新后自动同步到 GitHub（多人协作）",
+        variable=sync_var)
+    sync_cb.pack(side="left")
+    if not git_ok:
+        sync_cb.config(state="disabled")
+        ttk.Label(opts2, text="（当前目录不是 Git 仓库）").pack(
+            side="left", padx=(6, 0))
+
     btns = ttk.Frame(frm)
-    btns.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
+    btns.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 4))
     run_btn = ttk.Button(btns, text="开始计算")
     run_btn.pack(side="left")
     open_btn = ttk.Button(btns, text="打开输出文件", state="disabled")
     open_btn.pack(side="left", padx=(8, 0))
+    ttk.Button(btns, text="BOM 要求",
+               command=lambda: messagebox.showinfo("BOM 表要求", BOM_HELP)
+               ).pack(side="left", padx=(8, 0))
 
     log_text = scrolledtext.ScrolledText(frm, height=18, wrap="none",
                                          font=("Consolas", 9))
-    log_text.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
-    frm.rowconfigure(5, weight=1)
+    log_text.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+    frm.rowconfigure(6, weight=1)
 
     last_out = {"path": None}
 
@@ -505,6 +693,8 @@ def start_gui(selftest: bool = False):
                 rc_path=DEFAULT_RC if rc_var.get() else None,
                 update_stock=upd_var.get(),
                 backup=bak_var.get(),
+                sync=sync_var.get(),
+                repo_dir=BASE_DIR,
                 log=log,
             )
             last_out["path"] = res["out_path"]
@@ -543,6 +733,10 @@ def cli(argv=None) -> int:
     ap.add_argument("--no-rc", action="store_true", help="不用 0603 阻容清单")
     ap.add_argument("--dry-run", action="store_true", help="只计算，不扣库存")
     ap.add_argument("--no-backup", action="store_true", help="扣库存前不备份")
+    ap.add_argument("--no-sync", action="store_true",
+                    help="不同步库存表到 GitHub")
+    ap.add_argument("--repo", type=Path, default=None,
+                    help="Git 仓库目录（默认脚本 / exe 所在目录）")
     args = ap.parse_args(argv)
 
     run(
@@ -554,6 +748,8 @@ def cli(argv=None) -> int:
         threshold=args.threshold,
         update_stock=not args.dry_run,
         backup=not args.no_backup,
+        sync=not args.no_sync and not args.dry_run,
+        repo_dir=args.repo,
     )
     return 0
 
@@ -565,7 +761,8 @@ def _selftest() -> None:
     lines = [f"base={BASE_DIR}"]
     start_gui(selftest=True)
     lines.append("gui=ok")
-    lines.append(f"stock={DEFAULT_STOCK.exists()} rc={DEFAULT_RC.exists()}")
+    lines.append(f"stock={DEFAULT_STOCK.exists()} rc={DEFAULT_RC.exists()} "
+                 f"git={GitSync(BASE_DIR).available}")
 
     cands = sorted(p for p in BASE_DIR.glob("BOM*.xlsx")
                    if "比对结果" not in p.name and "需采购" not in p.name)
