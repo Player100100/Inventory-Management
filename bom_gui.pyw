@@ -46,7 +46,14 @@ from bom_vs_stock import (
     write_sheet,
 )
 
-BASE_DIR = Path(__file__).resolve().parent
+def _base_dir() -> Path:
+    """源码运行时是脚本目录；PyInstaller 打包后是 exe 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+BASE_DIR = _base_dir()
 DEFAULT_STOCK = BASE_DIR / "库存管理 副本.xlsx"
 DEFAULT_RC = BASE_DIR / "电阻电容.md"
 
@@ -369,7 +376,7 @@ def run(bom_path, sets: int, stock_path=None, out_path=None,
 # ---------------------------------------------------------------- GUI
 
 
-def start_gui():
+def start_gui(selftest: bool = False):
     import os
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -515,6 +522,8 @@ def start_gui():
     open_btn.config(command=open_output)
     sets_box.bind("<Return>", lambda _e: start())
 
+    if selftest:
+        root.after(500, root.destroy)
     root.mainloop()
 
 
@@ -549,7 +558,33 @@ def cli(argv=None) -> int:
     return 0
 
 
+def _selftest() -> None:
+    """打包后自检：建窗口、定位资源、跑一次比对，结果写入临时文件。"""
+    import tempfile
+
+    lines = [f"base={BASE_DIR}"]
+    start_gui(selftest=True)
+    lines.append("gui=ok")
+    lines.append(f"stock={DEFAULT_STOCK.exists()} rc={DEFAULT_RC.exists()}")
+
+    cands = sorted(p for p in BASE_DIR.glob("BOM*.xlsx")
+                   if "比对结果" not in p.name and "需采购" not in p.name)
+    if cands and DEFAULT_STOCK.exists():
+        try:
+            d = compute(cands[0], DEFAULT_STOCK, 1)
+            lines.append(f"compute=ok rows={len(d['results'])} "
+                         f"purchase={len(d['purchase_rows'])}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"compute=fail {e}")
+
+    Path(tempfile.gettempdir(), "bom_gui_selftest.txt").write_text(
+        "\n".join(lines), encoding="utf-8")
+
+
 if __name__ == "__main__":
-    if "--cli" in sys.argv:
+    if "--selftest" in sys.argv:
+        _selftest()
+    elif "--cli" in sys.argv:
         sys.exit(cli([a for a in sys.argv[1:] if a != "--cli"]))
-    start_gui()
+    else:
+        start_gui()
